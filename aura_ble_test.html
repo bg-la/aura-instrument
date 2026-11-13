@@ -1,0 +1,91 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AURA — test BLE</title>
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 640px; margin: 2rem auto; padding: 0 1rem; }
+  button { font-size: 1.2rem; padding: .6rem 1.2rem; }
+  table { border-collapse: collapse; margin-top: 1rem; width: 100%; }
+  td { padding: .3rem .6rem; border-bottom: 1px solid #ddd; font-variant-numeric: tabular-nums; }
+  td:first-child { font-weight: 600; width: 40%; }
+  #etat { margin-left: 1rem; }
+  .bar { height: 14px; background: #2a9d8f; width: 0; transition: width 40ms linear; }
+</style>
+</head>
+<body>
+<h1>AURA — test BLE</h1>
+<p>Chrome ou Edge. Ne pas appairer la carte dans les réglages Bluetooth.</p>
+<button id="connecter">Connecter une carte</button><span id="etat">non connecté</span>
+
+<table>
+  <tr><td>Carte</td><td id="nom">—</td></tr>
+  <tr><td>Gyroscope (°/s)</td><td id="gyro">—</td></tr>
+  <tr><td>Accélération (g)</td><td id="acc">—</td></tr>
+  <tr><td>Norme gyro (°/s)</td><td id="norme">—</td></tr>
+  <tr><td></td><td><div class="bar" id="barre"></div></td></tr>
+  <tr><td>Bouton</td><td id="bouton">—</td></tr>
+  <tr><td>MPU présent</td><td id="mpu">—</td></tr>
+  <tr><td>Paquets / s (pertes)</td><td id="debit">—</td></tr>
+</table>
+
+<script>
+const SERVICE_UUID = "3ce5a958-0be4-4446-b4b5-5d1c72e689f3";
+const DONNEES_UUID = "42999be0-a0be-48da-9040-20092c286f84";
+const $ = id => document.getElementById(id);
+
+let nbPaquets = 0, nbPertes = 0, dernierCompteur = null;
+
+function decoder(v) {             // v : DataView de 16 octets
+  return {
+    gyro:  [v.getInt16(0, true) / 10, v.getInt16(2, true) / 10, v.getInt16(4, true) / 10],
+    acc:   [v.getInt16(6, true) / 1000, v.getInt16(8, true) / 1000, v.getInt16(10, true) / 1000],
+    norme: v.getUint16(12, true) / 10,
+    bouton: (v.getUint8(14) & 1) === 1,
+    mpu:    (v.getUint8(14) & 2) === 2,
+    compteur: v.getUint8(15),
+  };
+}
+
+function surDonnees(event) {
+  const d = decoder(event.target.value);
+  if (dernierCompteur !== null) nbPertes += (d.compteur - dernierCompteur - 1 + 256) % 256;
+  dernierCompteur = d.compteur;
+  nbPaquets++;
+  $("gyro").textContent  = d.gyro.map(x => x.toFixed(1)).join("  ");
+  $("acc").textContent   = d.acc.map(x => x.toFixed(2)).join("  ");
+  $("norme").textContent = d.norme.toFixed(1);
+  $("barre").style.width = Math.min(100, d.norme / 3) + "%";
+  $("bouton").textContent = d.bouton ? "appuyé" : "relâché";
+  $("mpu").textContent    = d.mpu ? "oui" : "non";
+}
+
+setInterval(() => {
+  $("debit").textContent = `${nbPaquets} (${nbPertes})`;
+  nbPaquets = 0; nbPertes = 0;
+}, 1000);
+
+$("connecter").onclick = async () => {
+  if (!navigator.bluetooth) {
+    alert("Web Bluetooth indisponible : utiliser Chrome ou Edge (sous Linux, activer chrome://flags/#enable-experimental-web-platform-features).");
+    return;
+  }
+  try {
+    const appareil = await navigator.bluetooth.requestDevice({ filters: [{ services: [SERVICE_UUID] }] });
+    appareil.addEventListener("gattserverdisconnected", () => { $("etat").textContent = "déconnecté"; });
+    $("etat").textContent = "connexion…";
+    const serveur = await appareil.gatt.connect();
+    const service = await serveur.getPrimaryService(SERVICE_UUID);
+    const carac = await service.getCharacteristic(DONNEES_UUID);
+    carac.addEventListener("characteristicvaluechanged", surDonnees);
+    await carac.startNotifications();
+    $("nom").textContent = appareil.name || "(sans nom)";
+    $("etat").textContent = "connecté";
+  } catch (e) {
+    $("etat").textContent = "erreur : " + e.message;
+  }
+};
+</script>
+</body>
+</html>
