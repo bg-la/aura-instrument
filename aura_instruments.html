@@ -1,0 +1,470 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AURA — instruments</title>
+<script src="https://unpkg.com/tone@15.1.22"></script>
+<style>
+  :root { --fg:#111; --bg:#fff; --mut:#666; --acc:#0b6e63; --acc2:#c2410c; --line:#ccc; }
+  * { box-sizing: border-box; }
+  body { font-family: system-ui, sans-serif; color: var(--fg); background: var(--bg);
+         max-width: 900px; margin: 1.5rem auto; padding: 0 1rem; font-size: 1.05rem; }
+  h1 { margin: 0 0 .5rem; }
+  button, select { font-size: 1.05rem; padding: .55rem 1rem; border-radius: 8px;
+                   border: 2px solid var(--fg); background: var(--bg); color: var(--fg); cursor: pointer; }
+  button.principal { background: var(--acc); color: #fff; border-color: var(--acc); font-size: 1.2rem; }
+  button:focus-visible, input:focus-visible, select:focus-visible { outline: 3px solid var(--acc2); outline-offset: 2px; }
+  .barre-etat { display: flex; flex-wrap: wrap; gap: .5rem 1.2rem; align-items: center; margin: .8rem 0; }
+  .pastille { display: inline-block; width: 1rem; height: 1rem; border-radius: 50%;
+              background: var(--line); vertical-align: middle; margin-right: .3rem; }
+  .pastille.on { background: var(--acc2); }
+  #moniteur { width: 100%; height: 170px; border: 1px solid var(--line); border-radius: 8px; display: block; }
+  .legende { font-size: .9rem; color: var(--mut); margin: .3rem 0 1rem; }
+  .legende b { font-weight: 600; }
+  [role=tablist] { display: flex; gap: .4rem; border-bottom: 2px solid var(--fg); }
+  [role=tab] { border-radius: 8px 8px 0 0; border-bottom: none; font-size: 1.15rem; padding: .7rem 1.3rem; }
+  [role=tab][aria-selected=true] { background: var(--fg); color: var(--bg); }
+  [role=tabpanel] { padding: 1rem 0; }
+  .colonnes { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; }
+  @media (max-width: 700px) { .colonnes { grid-template-columns: 1fr; } }
+  fieldset { border: 2px solid var(--line); border-radius: 10px; padding: .6rem 1rem 1rem; margin: 0; }
+  legend { font-weight: 700; padding: 0 .3rem; }
+  .ctrl { margin: .7rem 0; }
+  .ctrl label { display: flex; justify-content: space-between; gap: .5rem; }
+  .ctrl output { font-variant-numeric: tabular-nums; color: var(--acc); font-weight: 600; }
+  .ctrl input[type=range] { width: 100%; height: 2rem; accent-color: var(--acc); }
+  .ctrl select { width: 100%; }
+  .ctrl.case label { justify-content: flex-start; align-items: center; }
+  .ctrl.case input { width: 1.4rem; height: 1.4rem; accent-color: var(--acc); }
+  .note { font-size: .9rem; color: var(--mut); }
+  #zoneSim { display: none; height: 160px; border: 3px dashed var(--acc); border-radius: 12px;
+             margin: .5rem 0 1rem; align-items: center; justify-content: center; text-align: center;
+             color: var(--mut); touch-action: none; user-select: none; }
+  #zoneSim.visible { display: flex; }
+  #zoneSim.appui { background: #fdebd8; }
+</style>
+</head>
+<body>
+<h1>AURA — instruments</h1>
+<p class="note">Chrome ou Edge. Ne pas appairer la carte dans les réglages Bluetooth.</p>
+
+<div class="barre-etat">
+  <button id="connecter" class="principal">Connecter une carte</button>
+  <span id="etat">non connecté</span>
+  <span>Carte : <b id="nom">—</b></span>
+  <span>Paquets/s : <b id="debit">—</b></span>
+  <span><span class="pastille" id="pastilleBouton"></span>bouton</span>
+</div>
+<label class="ctrl case" style="display:block"><input type="checkbox" id="simuler"> Pas de carte ? Simuler avec la souris</label>
+<div id="zoneSim">Bouge la souris (ou le doigt) ici.<br>Plus c'est rapide, plus c'est fort. Clic = bouton.</div>
+
+<canvas id="moniteur" aria-label="Mouvement mesuré"></canvas>
+<p class="legende"><b style="color:#999">gris</b> = mouvement brut · <b style="color:var(--acc)">vert</b> = mouvement lissé ·
+  <b style="color:var(--acc2)">orange</b> = seuil · barre à droite = valeur envoyée au son (0 → 1)</p>
+
+<div role="tablist" id="onglets" aria-label="Instruments"></div>
+<div id="panneaux"></div>
+
+<script>
+"use strict";
+// ---------- BLE (same protocol as aura_ble_test.html) ----------
+const SERVICE_UUID = "3ce5a958-0be4-4446-b4b5-5d1c72e689f3";
+const DONNEES_UUID = "42999be0-a0be-48da-9040-20092c286f84";
+const $ = id => document.getElementById(id);
+
+function decoder(v) {
+  return {
+    gyro:  [v.getInt16(0, true) / 10, v.getInt16(2, true) / 10, v.getInt16(4, true) / 10],
+    acc:   [v.getInt16(6, true) / 1000, v.getInt16(8, true) / 1000, v.getInt16(10, true) / 1000],
+    norme: v.getUint16(12, true) / 10,
+    bouton: (v.getUint8(14) & 1) === 1,
+    mpu:    (v.getUint8(14) & 2) === 2,
+    compteur: v.getUint8(15),
+  };
+}
+
+// ---------- Helpers ----------
+const clamp = (x, a, b) => Math.min(b, Math.max(a, x));
+const mtof = m => 440 * Math.pow(2, (m - 69) / 12);
+const NOMS = ["Do","Do#","Ré","Ré#","Mi","Fa","Fa#","Sol","Sol#","La","La#","Si"];
+const nomNote = m => NOMS[m % 12] + (Math.floor(m / 12) - 1);
+const optionsNotes = (lo, hi) => { const o = []; for (let m = lo; m <= hi; m++) o.push([m, nomNote(m)]); return o; };
+const GAMMES = { penta: [0, 2, 4, 7, 9], majeure: [0, 2, 4, 5, 7, 9, 11], chroma: [0,1,2,3,4,5,6,7,8,9,10,11] };
+function quantifier(m, racine, pas) {          // nearest scale degree to midi value m
+  const rel = m - racine, oct = Math.floor(rel / 12), r = rel - oct * 12;
+  let best = 0, d = 99;
+  for (const s of [...pas, 12]) if (Math.abs(s - r) < d) { d = Math.abs(s - r); best = s; }
+  return racine + oct * 12 + best;
+}
+
+// ---------- Gesture input: low-pass + range scaling + threshold ----------
+class Entree {
+  constructor(p) { this.p = p; this.reset(); }
+  reset() { this.y = null; this.t = null; this.arme = true; this.gate = false; }
+  echelle(x) {
+    const lo = Math.max(this.p.min, 0.1), hi = Math.max(this.p.max, lo + 1);
+    const v = this.p.log ? Math.log(Math.max(x, lo) / lo) / Math.log(hi / lo) : (x - lo) / (hi - lo);
+    return clamp(v, 0, 1);
+  }
+  update(brut, t) {
+    if (this.y === null) { this.y = brut; this.t = t; }
+    const dt = clamp(t - this.t, 0.001, 0.5); this.t = t;
+    const alpha = 1 - Math.exp(-2 * Math.PI * this.p.lissage * dt);   // one-pole LP, cutoff in Hz
+    this.y += alpha * (brut - this.y);
+    const seuil = this.p.seuil, bas = seuil * 0.8;                     // 20 % hysteresis
+    let declenche = false;
+    if (this.arme && this.y >= seuil) { declenche = true; this.arme = false; }
+    else if (!this.arme && this.y < bas) this.arme = true;
+    if (this.y >= seuil) this.gate = true; else if (this.y < bas) this.gate = false;
+    return { brut, y: this.y, v: this.echelle(this.y), vBrut: this.echelle(brut), declenche, gate: this.gate };
+  }
+}
+
+const SCHEMA_GESTE = [
+  { id: "seuil",   label: "Seuil",                       min: 5,   max: 400,  step: 1,   unite: "°/s" },
+  { id: "lissage", label: "Lissage (passe-bas)",         min: 0.2, max: 20,   step: 0.1, unite: "Hz",
+    aide: "Plus bas = plus doux mais plus lent." },
+  { id: "min",     label: "Mouvement minimum",           min: 1,   max: 200,  step: 1,   unite: "°/s" },
+  { id: "max",     label: "Mouvement maximum",           min: 50,  max: 1000, step: 5,   unite: "°/s" },
+  { id: "log",     label: "Échelle logarithmique",       type: "case" },
+];
+
+// ---------- Instruments ----------
+class Nappe {
+  constructor() {
+    this.nom = "Nappe";
+    this.description = "Un son tenu. Plus tu bouges, plus il est fort et brillant. Sous le seuil : silence.";
+    this.geste = { seuil: 15, lissage: 3, min: 10, max: 300, log: true };
+    this.p = { forme: "sawtooth", note: 48, epaisseur: 20, brillance: 3000, volume: 0.7, reverb: 0.3 };
+    this.schema = [
+      { id: "forme", label: "Forme d'onde", type: "select",
+        options: [["sine","douce (sinus)"],["triangle","ronde (triangle)"],["sawtooth","riche (dents de scie)"],["square","creuse (carré)"]] },
+      { id: "note", label: "Note", type: "select", num: true, options: optionsNotes(36, 60) },
+      { id: "epaisseur", label: "Épaisseur", min: 0, max: 60, step: 1, unite: "cents" },
+      { id: "brillance", label: "Brillance max", min: 400, max: 8000, step: 50, unite: "Hz" },
+      { id: "volume", label: "Volume", min: 0, max: 1, step: 0.01 },
+      { id: "reverb", label: "Réverbération", min: 0, max: 1, step: 0.01 },
+    ];
+    this.rev = new Tone.Reverb({ decay: 4, wet: this.p.reverb }).toDestination();
+    this.ampli = new Tone.Gain(0);
+    this.filtre = new Tone.Filter({ type: "lowpass", frequency: 150, Q: 1 });
+    this.osc = new Tone.FatOscillator({ type: this.p.forme, count: 3, spread: this.p.epaisseur, frequency: mtof(this.p.note) });
+    this.osc.chain(this.filtre, this.ampli, this.rev);
+    this.demarre = false;
+  }
+  activer() { if (!this.demarre) { this.osc.start(); this.demarre = true; } }
+  silence() { this.ampli.gain.rampTo(0, 0.1); }
+  update(s) {
+    const a = s.gate ? s.v : 0;
+    this.ampli.gain.rampTo(a * this.p.volume, 0.05);
+    this.filtre.frequency.rampTo(150 * Math.pow(this.p.brillance / 150, s.v), 0.05);
+  }
+  regler(id, val) {
+    if (id === "forme") this.osc.type = val;
+    if (id === "note") this.osc.frequency.rampTo(mtof(val), 0.1);
+    if (id === "epaisseur") this.osc.spread = val;
+    if (id === "reverb") this.rev.wet.value = val;
+  }
+}
+
+class Glissando {
+  constructor() {
+    this.nom = "Glissando";
+    this.description = "La vitesse du geste choisit la hauteur de la note. Sous le seuil : silence.";
+    this.geste = { seuil: 20, lissage: 5, min: 10, max: 300, log: true };
+    this.p = { forme: "triangle", basse: 48, haute: 72, gamme: "penta", glisse: 80, volume: 0.6, echo: 0.25 };
+    this.schema = [
+      { id: "forme", label: "Forme d'onde", type: "select",
+        options: [["sine","douce (sinus)"],["triangle","ronde (triangle)"],["sawtooth","riche (dents de scie)"],["square","creuse (carré)"]] },
+      { id: "basse", label: "Note la plus grave", type: "select", num: true, options: optionsNotes(36, 72) },
+      { id: "haute", label: "Note la plus aiguë", type: "select", num: true, options: optionsNotes(48, 96) },
+      { id: "gamme", label: "Notes jouées", type: "select",
+        options: [["continu","toutes (glissé continu)"],["chroma","demi-tons"],["majeure","gamme majeure"],["penta","gamme pentatonique"]] },
+      { id: "glisse", label: "Temps de glissé", min: 0, max: 600, step: 10, unite: "ms" },
+      { id: "volume", label: "Volume", min: 0, max: 1, step: 0.01 },
+      { id: "echo", label: "Écho", min: 0, max: 1, step: 0.01 },
+    ];
+    this.delai = new Tone.FeedbackDelay({ delayTime: 0.25, feedback: 0.35, wet: this.p.echo }).toDestination();
+    this.ampli = new Tone.Gain(0).connect(this.delai);
+    this.osc = new Tone.Oscillator({ type: this.p.forme, frequency: mtof(this.p.basse) }).connect(this.ampli);
+    this.demarre = false;
+  }
+  activer() { if (!this.demarre) { this.osc.start(); this.demarre = true; } }
+  silence() { this.ampli.gain.rampTo(0, 0.1); }
+  update(s) {
+    const lo = Math.min(this.p.basse, this.p.haute), hi = Math.max(this.p.basse, this.p.haute);
+    let m = lo + s.v * (hi - lo);
+    if (this.p.gamme !== "continu") m = clamp(quantifier(m, lo, GAMMES[this.p.gamme]), lo, hi);
+    this.osc.frequency.rampTo(mtof(m), Math.max(0.01, this.p.glisse / 1000));
+    this.ampli.gain.rampTo(s.gate ? this.p.volume : 0, 0.05);
+  }
+  regler(id, val) {
+    if (id === "forme") this.osc.type = val;
+    if (id === "echo") this.delai.wet.value = val;
+  }
+}
+
+class Echantillons {
+  constructor() {
+    this.nom = "Échantillons";
+    this.description = "Un geste vif qui dépasse le seuil joue un son. Le bouton de la carte peut aussi jouer.";
+    this.geste = { seuil: 120, lissage: 15, min: 50, max: 500, log: true };
+    this.p = { son: "piano", mode: "suite", note: 60, duree: 1, antirebond: 200, velo: true, bouton: true, volume: 0, reverb: 0.2 };
+    this.schema = [
+      { id: "son", label: "Son", type: "select", options: [["piano","piano"],["fichier","mon fichier"]] },
+      { id: "fichier", label: "Charger un son (wav, mp3…)", type: "fichier" },
+      { id: "mode", label: "Quelle note ?", type: "select",
+        options: [["fixe","toujours la même"],["suite","la suivante dans la gamme"],["hasard","au hasard dans la gamme"],["force","selon la force du geste"]] },
+      { id: "note", label: "Note de départ", type: "select", num: true, options: optionsNotes(36, 84) },
+      { id: "duree", label: "Durée", min: 0.1, max: 4, step: 0.1, unite: "s" },
+      { id: "antirebond", label: "Temps mini entre deux sons", min: 50, max: 1000, step: 10, unite: "ms" },
+      { id: "velo", label: "Plus fort si le geste est fort", type: "case" },
+      { id: "bouton", label: "Le bouton joue aussi", type: "case" },
+      { id: "volume", label: "Volume", min: -30, max: 6, step: 1, unite: "dB" },
+      { id: "reverb", label: "Réverbération", min: 0, max: 1, step: 0.01 },
+    ];
+    this.rev = new Tone.Reverb({ decay: 2.5, wet: this.p.reverb }).toDestination();
+    this.vol = new Tone.Volume(this.p.volume).connect(this.rev);
+    const urls = {};
+    for (const o of [2, 3, 4, 5, 6]) for (const n of ["C", "Ds", "Fs", "A"]) urls[n.replace("s", "#") + o] = `${n}${o}.mp3`;
+    this.statut = "chargement du piano…";
+    this.piano = new Tone.Sampler({ urls, baseUrl: "https://tonejs.github.io/audio/salamander/", release: 1,
+      onload: () => this.setStatut("piano prêt"), onerror: () => this.setStatut("erreur de chargement du piano") }).connect(this.vol);
+    this.perso = null;
+    this.dernier = -1e9; this.index = 0;
+  }
+  setStatut(t) { this.statut = t; const el = $("statut-echantillons"); if (el) el.textContent = t; }
+  activer() {}
+  silence() { this.piano.releaseAll(); this.perso?.releaseAll(); }
+  echantillonneur() { return this.p.son === "fichier" && this.perso ? this.perso : this.piano; }
+  jouer(force) {
+    const now = Tone.now();
+    if ((now - this.dernier) * 1000 < this.p.antirebond) return;
+    this.dernier = now;
+    const pas = GAMMES.penta, base = this.p.note;
+    const degre = i => base + 12 * Math.floor(i / pas.length) + pas[i % pas.length];
+    let m = base;
+    if (this.p.mode === "suite") m = degre(this.index++ % (2 * pas.length));
+    if (this.p.mode === "hasard") m = degre(Math.floor(Math.random() * 2 * pas.length));
+    if (this.p.mode === "force") m = degre(Math.round(force * (2 * pas.length - 1)));
+    const vel = this.p.velo ? 0.15 + 0.85 * force : 0.8;
+    const s = this.echantillonneur();
+    if (s.loaded) s.triggerAttackRelease(Tone.Frequency(m, "midi").toNote(), this.p.duree, now, vel);
+  }
+  update(s) { if (s.declenche) this.jouer(s.vBrut); }
+  bouton(appuye) { if (appuye && this.p.bouton) this.jouer(0.7); }
+  async regler(id, val) {
+    if (id === "volume") this.vol.volume.rampTo(val, 0.05);
+    if (id === "reverb") this.rev.wet.value = val;
+    if (id === "son" && val === "fichier" && !this.perso) this.setStatut("choisis d'abord un fichier");
+    if (id === "son" && val === "piano") this.setStatut(this.piano.loaded ? "piano prêt" : "chargement du piano…");
+    if (id === "fichier" && val) {
+      try {
+        this.setStatut("lecture du fichier…");
+        const buf = await Tone.getContext().decodeAudioData(await val.arrayBuffer());
+        this.perso?.dispose();
+        this.perso = new Tone.Sampler({ urls: { C4: buf }, release: 0.5 }).connect(this.vol);
+        this.p.son = "fichier"; $("ctrl-echantillons-son").value = "fichier";
+        this.setStatut(`fichier prêt : ${val.name} (joué en Do4 = note d'origine)`);
+      } catch (e) { this.setStatut("fichier illisible : " + e.message); }
+    }
+  }
+}
+
+// ---------- UI construction ----------
+function construireControles(conteneur, schema, valeurs, prefixe, surChange) {
+  for (const it of schema) {
+    const div = document.createElement("div");
+    div.className = "ctrl" + (it.type === "case" ? " case" : "");
+    const idc = `ctrl-${prefixe}-${it.id}`;
+    const label = document.createElement("label"); label.htmlFor = idc;
+    let input;
+    if (it.type === "select") {
+      input = document.createElement("select");
+      for (const [v, t] of it.options) input.add(new Option(t, v));
+      input.value = valeurs[it.id];
+      input.onchange = () => { const v = it.num ? +input.value : input.value; valeurs[it.id] = v; surChange(it.id, v); };
+      label.textContent = it.label; div.append(label, input);
+    } else if (it.type === "case") {
+      input = document.createElement("input"); input.type = "checkbox"; input.checked = valeurs[it.id];
+      input.onchange = () => { valeurs[it.id] = input.checked; surChange(it.id, input.checked); };
+      label.append(input, " " + it.label); div.append(label);
+    } else if (it.type === "fichier") {
+      input = document.createElement("input"); input.type = "file"; input.accept = "audio/*";
+      input.onchange = () => surChange(it.id, input.files[0]);
+      label.textContent = it.label; div.append(label, input);
+    } else {
+      input = document.createElement("input"); input.type = "range";
+      Object.assign(input, { min: it.min, max: it.max, step: it.step, value: valeurs[it.id] });
+      const out = document.createElement("output");
+      const aff = v => out.textContent = (+v).toLocaleString("fr-FR", { maximumFractionDigits: 2 }) + (it.unite ? " " + it.unite : "");
+      aff(input.value);
+      input.oninput = () => { valeurs[it.id] = +input.value; aff(input.value); surChange(it.id, +input.value); };
+      const span = document.createElement("span"); span.textContent = it.label;
+      label.append(span, out); div.append(label, input);
+    }
+    input.id = idc;
+    if (it.aide) { const n = document.createElement("div"); n.className = "note"; n.textContent = it.aide; div.append(n); }
+    conteneur.append(div);
+  }
+}
+
+if (!window.Tone) {
+  document.body.insertAdjacentHTML("afterbegin", "<p style='color:red'>Tone.js n'a pas pu être chargé (connexion internet ?).</p>");
+}
+const instruments = [new Nappe(), new Glissando(), new Echantillons()];
+const prefixes = ["nappe", "glissando", "echantillons"];
+let actif = instruments[0];
+
+instruments.forEach((inst, i) => {
+  inst.entree = new Entree(inst.geste);
+  const onglet = document.createElement("button");
+  Object.assign(onglet, { id: `onglet-${i}`, textContent: inst.nom });
+  onglet.setAttribute("role", "tab");
+  onglet.setAttribute("aria-controls", `panneau-${i}`);
+  onglet.onclick = () => choisir(i);
+  onglet.onkeydown = e => {
+    const d = e.key === "ArrowRight" ? 1 : e.key === "ArrowLeft" ? -1 : 0;
+    if (d) { const j = (i + d + instruments.length) % instruments.length; choisir(j); $(`onglet-${j}`).focus(); }
+  };
+  $("onglets").append(onglet);
+
+  const pan = document.createElement("div");
+  Object.assign(pan, { id: `panneau-${i}` });
+  pan.setAttribute("role", "tabpanel"); pan.setAttribute("aria-labelledby", `onglet-${i}`);
+  pan.innerHTML = `<p>${inst.description}</p>` +
+    (inst instanceof Echantillons ? `<p class="note">État : <span id="statut-echantillons">${inst.statut}</span></p>` : "") +
+    `<div class="colonnes"><fieldset><legend>Le son</legend></fieldset><fieldset><legend>Le geste</legend></fieldset></div>`;
+  const [fsSon, fsGeste] = pan.querySelectorAll("fieldset");
+  construireControles(fsSon, inst.schema, inst.p, prefixes[i], (id, v) => inst.regler(id, v));
+  construireControles(fsGeste, SCHEMA_GESTE, inst.geste, prefixes[i] + "-geste", () => {});
+  $("panneaux").append(pan);
+});
+
+function choisir(i) {
+  actif.silence();
+  actif = instruments[i];
+  actif.entree.reset();
+  if (Tone.context.state === "running") actif.activer();
+  instruments.forEach((_, j) => {
+    $(`onglet-${j}`).setAttribute("aria-selected", j === i);
+    $(`onglet-${j}`).tabIndex = j === i ? 0 : -1;
+    $(`panneau-${j}`).hidden = j !== i;
+  });
+}
+choisir(0);
+
+async function demarrerSon() {
+  if (Tone.context.state !== "running") await Tone.start();
+  actif.activer();
+}
+
+// ---------- Common sample path (BLE or simulation) ----------
+const HIST = 200;                    // ~5 s at 40 Hz
+const historique = [];
+let dernierBouton = false;
+
+function traiter(norme, bouton) {
+  if (bouton !== dernierBouton) {
+    dernierBouton = bouton;
+    $("pastilleBouton").classList.toggle("on", bouton);
+    actif.bouton?.(bouton);
+  }
+  const s = actif.entree.update(norme, performance.now() / 1000);
+  actif.update(s);
+  historique.push(s); if (historique.length > HIST) historique.shift();
+}
+
+// ---------- BLE connection ----------
+let nbPaquets = 0, nbPertes = 0, dernierCompteur = null;
+function surDonnees(event) {
+  const d = decoder(event.target.value);
+  if (dernierCompteur !== null) nbPertes += (d.compteur - dernierCompteur - 1 + 256) % 256;
+  dernierCompteur = d.compteur; nbPaquets++;
+  if (!d.mpu) $("etat").textContent = "connecté — capteur de mouvement absent !";
+  traiter(d.norme, d.bouton);
+}
+setInterval(() => { $("debit").textContent = `${nbPaquets} (pertes : ${nbPertes})`; nbPaquets = 0; nbPertes = 0; }, 1000);
+
+$("connecter").onclick = async () => {
+  if (!navigator.bluetooth) {
+    alert("Web Bluetooth indisponible : utiliser Chrome ou Edge (sous Linux, activer chrome://flags/#enable-experimental-web-platform-features).");
+    return;
+  }
+  const son = demarrerSon();          // not awaited: keep the user gesture for requestDevice
+  try {
+    const appareil = await navigator.bluetooth.requestDevice({ filters: [{ services: [SERVICE_UUID] }] });
+    appareil.addEventListener("gattserverdisconnected", () => { $("etat").textContent = "déconnecté"; actif.silence(); });
+    $("etat").textContent = "connexion…";
+    const serveur = await appareil.gatt.connect();
+    const service = await serveur.getPrimaryService(SERVICE_UUID);
+    const carac = await service.getCharacteristic(DONNEES_UUID);
+    carac.addEventListener("characteristicvaluechanged", surDonnees);
+    await carac.startNotifications();
+    await son;
+    dernierCompteur = null;
+    $("nom").textContent = appareil.name || "(sans nom)";
+    $("etat").textContent = "connecté";
+  } catch (e) {
+    $("etat").textContent = "erreur : " + e.message;
+  }
+};
+
+// ---------- Mouse / touch simulation (40 Hz, like the board) ----------
+let simTimer = null, simDist = 0, simDernier = null, simAppui = false, simT = performance.now();
+const zone = $("zoneSim");
+zone.addEventListener("pointermove", e => {
+  if (simDernier) simDist += Math.hypot(e.clientX - simDernier[0], e.clientY - simDernier[1]);
+  simDernier = [e.clientX, e.clientY];
+});
+zone.addEventListener("pointerleave", () => { simDernier = null; });
+zone.addEventListener("pointerdown", e => { simAppui = true; zone.classList.add("appui"); zone.setPointerCapture(e.pointerId); });
+zone.addEventListener("pointerup", () => { simAppui = false; zone.classList.remove("appui"); });
+$("simuler").onchange = async e => {
+  zone.classList.toggle("visible", e.target.checked);
+  clearInterval(simTimer);
+  if (e.target.checked) {
+    await demarrerSon();
+    simT = performance.now();
+    simTimer = setInterval(() => {
+      const t = performance.now(), dt = (t - simT) / 1000; simT = t;
+      traiter(Math.min(2000, 0.6 * simDist / dt), simAppui);   // px/s → pseudo °/s
+      simDist = 0;
+    }, 25);
+  } else actif.silence();
+};
+
+// ---------- Monitor ----------
+const cv = $("moniteur"), ctx = cv.getContext("2d");
+function dessiner() {
+  const dpr = window.devicePixelRatio || 1, W = cv.clientWidth, H = cv.clientHeight;
+  if (cv.width !== W * dpr) { cv.width = W * dpr; cv.height = H * dpr; }
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, W, H);
+  const g = actif.geste, yMax = Math.max(g.max, g.seuil) * 1.2, Wp = W - 40;
+  const Y = v => H - 6 - (H - 12) * clamp(v / yMax, 0, 1);
+  const X = i => (i + HIST - historique.length) * Wp / (HIST - 1);
+  ctx.strokeStyle = "#e5e5e5"; ctx.lineWidth = 1;
+  for (const v of [g.min, g.max]) { ctx.beginPath(); ctx.moveTo(0, Y(v)); ctx.lineTo(Wp, Y(v)); ctx.stroke(); }
+  const trace = (cle, coul, ep) => {
+    ctx.strokeStyle = coul; ctx.lineWidth = ep; ctx.beginPath();
+    historique.forEach((s, i) => i ? ctx.lineTo(X(i), Y(s[cle])) : ctx.moveTo(X(i), Y(s[cle])));
+    ctx.stroke();
+  };
+  trace("brut", "#aaa", 1); trace("y", "#0b6e63", 2.5);
+  ctx.strokeStyle = "#c2410c"; ctx.setLineDash([6, 4]); ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.moveTo(0, Y(g.seuil)); ctx.lineTo(Wp, Y(g.seuil)); ctx.stroke(); ctx.setLineDash([]);
+  ctx.fillStyle = "#c2410c";
+  historique.forEach((s, i) => { if (s.declenche) ctx.fillRect(X(i) - 2, 0, 4, 10); });
+  const der = historique[historique.length - 1];
+  ctx.fillStyle = "#eee"; ctx.fillRect(W - 28, 6, 22, H - 12);
+  if (der) { const h = (H - 12) * der.v; ctx.fillStyle = der.gate ? "#0b6e63" : "#9cc"; ctx.fillRect(W - 28, H - 6 - h, 22, h); }
+  ctx.fillStyle = "#666"; ctx.font = "11px system-ui";
+  ctx.fillText(`${Math.round(yMax)} °/s`, 4, 12);
+  requestAnimationFrame(dessiner);
+}
+requestAnimationFrame(dessiner);
+</script>
+</body>
+</html>
